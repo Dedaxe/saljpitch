@@ -504,76 +504,75 @@ async function extractDataFromUrl(companyUrl) {
 // --- Main Orchestrator ---
 async function main() {
     console.log('--- Starting Allabolag Scraper (Supabase Mode) ---');
-  
-    // --- Heartbeat Monitoring Setup ---
+    
     const heartbeatUrl = 'https://uptime.betterstack.com/api/v1/heartbeat/aqrzzpHiHPaqFd9F61JU17Ms';
-    let heartbeatInterval = null; // Declare here to access it in the 'finally' block
+    let heartbeatInterval = null;
   
-    const resumeFromCompany = process.argv[2];
-    const limit = pLimit(30); // Adjust concurrency as needed
+    const limit = pLimit(30); // Your concurrency limit
   
-    let sourceDb = null;
+    // --- Batch Processing Setup ---
+    const BATCH_SIZE = 1000;
+    let processedCount = 0;
+  
     try {
-      // --- Start the Heartbeat ---
       heartbeatInterval = setInterval(() => {
-        fetch(heartbeatUrl).catch(err => {
-          // Log error but don't crash the main script if the ping fails
-          console.warn('[MONITORING] Heartbeat ping failed:', err.message);
-        });
-      }, 60 * 1000); // Ping every 60 seconds
+        fetch(heartbeatUrl).catch(err => console.warn('[MONITORING] Heartbeat ping failed:', err.message));
+      }, 60 * 1000);
   
-      sourceDb = await open({ filename: './allabolag.db', driver: sqlite3.Database, mode: sqlite3.OPEN_READONLY });
-      const allCompanies = await sourceDb.all('SELECT companyName FROM companies');
-      let searchTerms = allCompanies.map(c => c.companyName);
+      // 1. Get the total count of companies from Supabase
+      const { count: total, error: countError } = await supabase
+        .from('companies_to_scrape')
+        .select('*', { count: 'exact', head: true });
   
-      if (resumeFromCompany) {
-        const resumeIndex = searchTerms.findIndex(name => name.toLowerCase() === resumeFromcompany.toLowerCase());
-        if (resumeIndex !== -1) {
-          searchTerms = searchTerms.slice(resumeIndex); // Slice from the company to resume at
-          console.log(`Resuming from "${resumeFromCompany}". Processing ${searchTerms.length} companies.`);
-        } else {
-          console.warn(`[WARN] Resume company "${resumeFromCompany}" not found. Starting from the beginning.`);
+      if (countError) throw new Error(`Could not get company count: ${countError.message}`);
+      console.log(`Found ${total} companies to process from Supabase.`);
+  
+      // 2. Loop through the Supabase table in batches of 1000
+      for (let offset = 0; offset < total; offset += BATCH_SIZE) {
+        console.log(`--- Processing batch: rows ${offset} to ${offset + BATCH_SIZE} ---`);
+        
+        // 3. Fetch the next batch using .range()
+        const { data: batch, error: batchError } = await supabase
+          .from('companies_to_scrape')
+          .select('companyName') // Use the correct column name
+          .range(offset, offset + BATCH_SIZE - 1);
+  
+        if (batchError) {
+          console.error(`[DB-ERROR] Error fetching batch: ${batchError.message}`);
+          continue; // Skip to the next batch on error
         }
-      } else {
-        console.log(`Found ${searchTerms.length} companies to process from the database.`);
-      }
   
-      let count = 0;
-      const total = searchTerms.length;
-      
-      const tasks = searchTerms.map(term => {
-        return limit(async () => {
-          const url = await findBestCompanyUrl(term);
-          if (!url) return;
+        const searchTerms = batch.map(c => c.companyName);
   
-          const extractedData = await extractDataFromUrl(url);
-          if (!extractedData) return;
-          
-          // Push company data to Supabase
-          await insertCompanyData(supabase, extractedData.companyData, url);
+        const tasks = searchTerms.map(term => {
+          return limit(async () => {
+            const url = await findBestCompanyUrl(term);
+            if (!url) return;
   
-          // Push all related executive data to Supabase
-          if (extractedData.allExecutivesData) {
-            for (const personData of extractedData.allExecutivesData) {
-              await insertPersonData(supabase, personData);
+            const extractedData = await extractDataFromUrl(url);
+            if (!extractedData) return;
+  
+            await insertCompanyData(supabase, extractedData.companyData, url);
+  
+            if (extractedData.allExecutivesData) {
+              for (const personData of extractedData.allExecutivesData) {
+                await insertPersonData(supabase, personData);
+              }
             }
-          }
-          count++;
-          console.log(`[PROGRESS] ${count}/${total} companies processed.`);
+            processedCount++;
+            console.log(`[PROGRESS] ${processedCount}/${total} companies processed.`);
+          });
         });
-      });
   
-      await Promise.all(tasks);
+        await Promise.all(tasks); // Wait for the current batch to finish before getting the next one
+      }
   
     } catch (error) {
       console.error('[CRITICAL] A fatal error occurred:', error);
     } finally {
-      // --- Stop the Heartbeat ---
       if (heartbeatInterval) {
         clearInterval(heartbeatInterval);
       }
-      
-      if (sourceDb) await sourceDb.close();
       console.log('--- Scraper finished. ---');
     }
   }
