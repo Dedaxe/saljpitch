@@ -510,7 +510,7 @@ async function main() {
     let heartbeatInterval = null; // Declare here to access it in the 'finally' block
   
     const resumeFromCompany = process.argv[2];
-    const limit = pLimit(1); // Adjust concurrency as needed
+    const limit = pLimit(30); // Adjust concurrency as needed
   
     let sourceDb = null;
     try {
