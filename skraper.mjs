@@ -523,7 +523,9 @@ async function main() {
       const { data: batch, error: batchError } = await supabase
         .from('companies_to_scrape')
         .select('id, "companyName"')
-        .not('status', 'in', '("finished", "failed")') // Fetches only companies not yet marked
+        // --- FIX IS HERE ---
+        // This explicitly includes rows where status is NULL, fixing the issue.
+        .or('status.is.null,status.not.in.("finished","failed")')
         .order('id', { ascending: true })
         .limit(BATCH_SIZE);
 
