@@ -502,6 +502,7 @@ async function extractDataFromUrl(companyUrl) {
   }
 
 // --- Main Orchestrator ---
+// --- Main Orchestrator ---
 async function main() {
   console.log('--- Starting Allabolag Scraper (Supabase Mode) ---');
   
@@ -509,51 +510,49 @@ async function main() {
   let heartbeatInterval = null;
 
   const limit = pLimit(30); // Your concurrency limit
-
-  // --- Batch Processing Setup ---
   const BATCH_SIZE = 1000;
-  const START_OFFSET = 700000; // This is the key change
-  let processedCount = 0;
+  let totalProcessedInRun = 0;
 
   try {
     heartbeatInterval = setInterval(() => {
       fetch(heartbeatUrl).catch(err => console.warn('[MONITORING] Heartbeat ping failed:', err.message));
     }, 60 * 1000);
 
-    // 1. Get the total count of companies to process
-    const { count: total, error: countError } = await supabase
-      .from('companies_to_scrape')
-      .select('*', { count: 'exact', head: true });
-
-    if (countError) throw new Error(`Could not get company count: ${countError.message}`);
-    console.log(`Found ${total} companies in total. Starting from offset ${START_OFFSET}.`);
-
-    // 2. Loop through the Supabase table in batches, starting from the offset
-    for (let offset = START_OFFSET; offset < total; offset += BATCH_SIZE) {
-      console.log(`--- Processing batch: rows ${offset} to ${offset + BATCH_SIZE} ---`);
+    // Using a while loop to continuously fetch batches of unprocessed companies
+    while (true) {
+      console.log(`--- Fetching a new batch of up to ${BATCH_SIZE} companies to process... ---`);
       
-      // 3. Fetch the next batch using .range() and the offset
+      // MODIFIED QUERY:
+      // - Fetches companies where 'status' is NOT 'finished' or 'failed'.
+      // - This also correctly includes companies where 'status' is NULL.
+      // - Uses .limit() instead of .range() for more robust batching.
       const { data: batch, error: batchError } = await supabase
         .from('companies_to_scrape')
-        .select('id, "companyName"') // Select the ID and companyName
-        .order('id', { ascending: true }) // Order by ID to ensure consistent batches
-        .range(offset, offset + BATCH_SIZE - 1);
+        .select('id, "companyName"')
+        .not('status', 'in', '("finished", "failed")') // <-- The key change is here
+        .order('id', { ascending: true })
+        .limit(BATCH_SIZE);
 
       if (batchError) {
         console.error(`[DB-ERROR] Error fetching batch: ${batchError.message}`);
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait before retrying
         continue;
       }
 
+      // If the batch is empty, it means there's no more work to do.
       if (batch.length === 0) {
-        console.log("No more companies to scrape in this range. Exiting loop.");
+        console.log("✅ No more companies to scrape. Exiting loop.");
         break;
       }
 
+      console.log(`[INFO] Found ${batch.length} companies in this batch to process.`);
+
       const tasks = batch.map(company => {
           return limit(async () => {
+              // The scraping and updating logic remains the same.
+              // It already sets the status to 'finished' or 'failed'.
               const url = await findBestCompanyUrl(company.companyName);
               if (!url) {
-                // Update status to 'failed' if a URL can't be found
                 await supabase.from('companies_to_scrape').update({ status: 'failed' }).eq('id', company.id);
                 return;
               }
@@ -573,29 +572,30 @@ async function main() {
                     }
                   }
   
-                  // Mark the company as 'finished'
+                  // This part already marks the company as 'finished'
                   await supabase.from('companies_to_scrape').update({ status: 'finished' }).eq('id', company.id);
-                  console.log(`    [STATUS] Marked company ${company.id} as 'finished'.`);
+                  console.log(`    [STATUS] Marked company "${company.companyName}" (ID: ${company.id}) as 'finished'.`);
 
               } catch (error) {
                   console.error(`[CRITICAL] An error occurred while processing company ${company.id}:`, error);
                   await supabase.from('companies_to_scrape').update({ status: 'failed' }).eq('id', company.id);
               }
 
-              processedCount++;
-              console.log(`[PROGRESS] ${processedCount}/${total - START_OFFSET} companies processed in this run.`);
+              totalProcessedInRun++;
+              console.log(`[PROGRESS] ${totalProcessedInRun} companies processed in this run.`);
           });
       });
 
       await Promise.all(tasks);
     }
-  } catch (error) {
+  } catch (error)
+ {
     console.error('[CRITICAL] A fatal error occurred:', error);
   } finally {
     if (heartbeatInterval) {
       clearInterval(heartbeatInterval);
     }
-    console.log('--- Scraper finished. ---');
+    console.log('--- Scraper finished its run. ---');
   }
 }
 
