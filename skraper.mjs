@@ -502,14 +502,13 @@ async function extractDataFromUrl(companyUrl) {
   }
 
 // --- Main Orchestrator ---
-// --- Main Orchestrator ---
 async function main() {
-  console.log('--- Starting Allabolag Scraper (Supabase Mode) ---');
+  console.log('--- Starting Allabolag Scraper (Simple Mode) ---');
   
   const heartbeatUrl = 'https://uptime.betterstack.com/api/v1/heartbeat/aqrzzpHiHPaqFd9F61JU17Ms';
   let heartbeatInterval = null;
 
-  const limit = pLimit(30); // Your concurrency limit
+  const limit = pLimit(30);
   const BATCH_SIZE = 1000;
   let totalProcessedInRun = 0;
 
@@ -518,28 +517,22 @@ async function main() {
       fetch(heartbeatUrl).catch(err => console.warn('[MONITORING] Heartbeat ping failed:', err.message));
     }, 60 * 1000);
 
-    // Using a while loop to continuously fetch batches of unprocessed companies
     while (true) {
       console.log(`--- Fetching a new batch of up to ${BATCH_SIZE} companies to process... ---`);
       
-      // MODIFIED QUERY:
-      // - Fetches companies where 'status' is NOT 'finished' or 'failed'.
-      // - This also correctly includes companies where 'status' is NULL.
-      // - Uses .limit() instead of .range() for more robust batching.
       const { data: batch, error: batchError } = await supabase
         .from('companies_to_scrape')
         .select('id, "companyName"')
-        .not('status', 'in', '("finished", "failed")') // <-- The key change is here
+        .not('status', 'in', '("finished", "failed")') // Fetches only companies not yet marked
         .order('id', { ascending: true })
         .limit(BATCH_SIZE);
 
       if (batchError) {
         console.error(`[DB-ERROR] Error fetching batch: ${batchError.message}`);
-        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait before retrying
+        await new Promise(resolve => setTimeout(resolve, 5000));
         continue;
       }
 
-      // If the batch is empty, it means there's no more work to do.
       if (batch.length === 0) {
         console.log("✅ No more companies to scrape. Exiting loop.");
         break;
@@ -549,8 +542,6 @@ async function main() {
 
       const tasks = batch.map(company => {
           return limit(async () => {
-              // The scraping and updating logic remains the same.
-              // It already sets the status to 'finished' or 'failed'.
               const url = await findBestCompanyUrl(company.companyName);
               if (!url) {
                 await supabase.from('companies_to_scrape').update({ status: 'failed' }).eq('id', company.id);
@@ -572,7 +563,6 @@ async function main() {
                     }
                   }
   
-                  // This part already marks the company as 'finished'
                   await supabase.from('companies_to_scrape').update({ status: 'finished' }).eq('id', company.id);
                   console.log(`    [STATUS] Marked company "${company.companyName}" (ID: ${company.id}) as 'finished'.`);
 
@@ -588,8 +578,7 @@ async function main() {
 
       await Promise.all(tasks);
     }
-  } catch (error)
- {
+  } catch (error) {
     console.error('[CRITICAL] A fatal error occurred:', error);
   } finally {
     if (heartbeatInterval) {
