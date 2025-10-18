@@ -33,19 +33,30 @@ async function batchUpsert(supabase, tableName, data, onConflict) {
 }
 
 async function fetchWithRetry(url, options, retries = 5, retryDelay = 1000) {
-    for (let i = 0; i <= retries; i++) {
-      try {
-        const response = await fetch(url, options);
-        if (response.ok) return response;
-        console.warn(`[RETRY] Attempt ${i + 1}/${retries + 1} for ${url} failed with status: ${response.status}`);
-      } catch (error) {
-        console.warn(`[RETRY] Attempt ${i + 1}/${retries + 1} for ${url} failed with network error: ${error.message}`);
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const response = await fetch(url, options);
+      
+      // If the request was successful, return immediately.
+      if (response.ok) return response;
+
+      // --- NEW CODE BLOCK ---
+      // If the server says "Not Found", don't retry. Treat it as a final answer.
+      if (response.status === 404) {
+          console.log(`    [INFO] Received 404 for ${url}. No data available, not retrying.`);
+          return response; // Return the 404 response to be handled by the caller
       }
-      if (i === retries) break;
-      const delay = retryDelay * Math.pow(2, i);
-      await new Promise(resolve => setTimeout(resolve, delay));
+      // --- END OF NEW CODE BLOCK ---
+
+      console.warn(`[RETRY] Attempt ${i + 1}/${retries + 1} for ${url} failed with status: ${response.status}`);
+    } catch (error) {
+      console.warn(`[RETRY] Attempt ${i + 1}/${retries + 1} for ${url} failed with network error: ${error.message}`);
     }
-    throw new Error(`All ${retries + 1} attempts failed for ${url}`);
+    if (i === retries) break;
+    const delay = retryDelay * Math.pow(2, i);
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  throw new Error(`All ${retries + 1} attempts failed for ${url}`);
 }
 
 // --- Corporate Structure Scraper Functions ---
@@ -62,7 +73,7 @@ function flattenCorporateTree(node, results, mainCompanyOrgnr) {
     // Push only the specific fields for the corporate_structure table
     results.push({
       company_id: mainCompanyOrgnr,
-      subsidiary_orgnr: node.organisationNumber,
+      subsidiary_orgnr: node.organisationNumber || 'N/A',
       subsidiary_name: node.name,
       owned_percentage: node.ownedPercentage,
       country_code: node.countryCode,
@@ -112,55 +123,73 @@ async function scrapeCorporateStructure(orgnr) {
 
 // --- Main Orchestrator ---
 
+// --- Main Orchestrator ---
+
 async function main() {
-    console.log('--- Starting Corporate Structure Scraper ---');
+  console.log('--- Starting Corporate Structure Scraper ---');
 
-    const limit = pLimit(30);
-    const BATCH_SIZE = 1000;
-    let processedCount = 0;
+  const limit = pLimit(30);
+  const BATCH_SIZE = 1000;
+  let processedCount = 0;
 
-    try {
-        const { count: total, error: countError } = await supabase
-          .from('companies')
-          .select('orgnr', { count: 'exact', head: true });
+  try {
+      // --- CHANGE THIS ---
+      // Get total count of ONLY unprocessed companies
+      const { count: total, error: countError } = await supabase
+        .from('companies')
+        .select('orgnr', { count: 'exact', head: true })
+        .is('structure_scraped_at', null); // <-- ADD THIS LINE
 
-        if (countError) throw new Error(`Could not get company count: ${countError.message}`);
-        console.log(`Found ${total} companies to process.`);
+      if (countError) throw new Error(`Could not get company count: ${countError.message}`);
+      console.log(`Found ${total} companies remaining to process.`);
+      if (total === 0) return; // Exit if no work to do
 
-        for (let offset = 0; offset < total; offset += BATCH_SIZE) {
-            console.log(`--- Processing batch: rows ${offset} to ${offset + BATCH_SIZE} ---`);
+      for (let offset = 0; offset < total; offset += BATCH_SIZE) {
+          console.log(`--- Processing batch: rows ${offset} to ${offset + BATCH_SIZE} ---`);
+          
+          // --- AND CHANGE THIS ---
+          // Fetch a batch of ONLY unprocessed companies
+          const { data: companies, error: batchError } = await supabase
+            .from('companies')
+            .select('orgnr')
+            .is('structure_scraped_at', null) // <-- ADD THIS LINE
+            .range(offset, offset + BATCH_SIZE - 1);
 
-            const { data: companies, error: batchError } = await supabase
-              .from('companies')
-              .select('orgnr')
-              .range(offset, offset + BATCH_SIZE - 1);
+          if (batchError) {
+              console.error(`[DB-ERROR] Error fetching batch: ${batchError.message}`);
+              continue;
+          }
 
-            if (batchError) {
-                console.error(`[DB-ERROR] Error fetching batch: ${batchError.message}`);
-                continue;
-            }
+          const orgnrs = companies.map(c => c.orgnr);
 
-            const orgnrs = companies.map(c => c.orgnr);
+          const tasks = orgnrs.map(orgnr => {
+              return limit(async () => {
+                  const corporateStructure = await scrapeCorporateStructure(orgnr);
+                  
+                  if (corporateStructure && corporateStructure.length > 0) {
+                      await batchUpsert(supabase, 'corporate_structure_2', corporateStructure, 'company_id, subsidiary_orgnr, subsidiary_name');
+                  }
+                  
+                  // --- FINALLY, ADD THIS ---
+                  // Mark this company as processed, whether structure was found or not
+                  await supabase
+                      .from('companies')
+                      .update({ structure_scraped_at: new Date() })
+                      .eq('orgnr', orgnr);
+                  
+                  processedCount++;
+                  console.log(`[PROGRESS] ${processedCount}/${total} companies processed in this run.`);
+              });
+          });
 
-            const tasks = orgnrs.map(orgnr => {
-                return limit(async () => {
-                    const corporateStructure = await scrapeCorporateStructure(orgnr);
-                    if (corporateStructure && corporateStructure.length > 0) {
-                        await batchUpsert(supabase, 'corporate_structure', corporateStructure, 'company_id, subsidiary_orgnr, subsidiary_name');
-                    }
-                    processedCount++;
-                    console.log(`[PROGRESS] ${processedCount}/${total} companies processed.`);
-                });
-            });
+          await Promise.all(tasks);
+      }
 
-            await Promise.all(tasks);
-        }
-
-    } catch (error) {
-        console.error('[CRITICAL] A fatal error occurred:', error);
-    } finally {
-        console.log('--- Corporate Structure Scraper finished. ---');
-    }
+  } catch (error) {
+      console.error('[CRITICAL] A fatal error occurred:', error);
+  } finally {
+      console.log('--- Corporate Structure Scraper finished. ---');
+  }
 }
 
 main();
